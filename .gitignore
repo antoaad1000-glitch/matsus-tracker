@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+settings.json
+share/
+build/
+dist/
+*.spec
