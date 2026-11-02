@@ -1,4 +1,4 @@
-"""Matsu's Tracker (by MatsuHikaru): small always-on-top PokeMMO dashboard for [SWARMS] and [KIDS] callouts.
+"""Matsu's Tracker (by MatsuHikaru): small always-on-top PokeMMO dashboard for swarm, kids and miniboss callouts.
 
 Reads the newest chat_*.log in the PokeMMO log folder (needs client.gui.chat.log_chat=true)
 and keeps following it, switching to a new file when the date rolls over.
@@ -64,8 +64,132 @@ REGIONS = [
 LINE_RE = re.compile(r"^\[(\d+/\d+/\d+ \d+:\d+:\d+ [AP]M)\] \[([^\]]+)\](?:\[([^\]]+)\])? ?(.*)$")
 META_RE = re.compile(r"\s*\{M:[^}]*\}\s*$")
 COLOR_RE = re.compile(r"\[#[0-9a-fA-F]*\]")
-KIDS_RE = re.compile(r"\[KIDS\]\s*:(\w*):\s*(.*)$")
 STATUS_RE = re.compile(r"\((\?|old)\)\s*$", re.I)
+
+# Callers are random and each writes callouts their own way, so parsing is keyword based:
+# find the section tags anywhere in the message, then read whatever sits between them.
+# Users can add their own tags in Settings › Callout formats.
+DEFAULT_TAGS = {
+    "swarms": ["[SWARMS]", "[SWARM]", "Swarms:", "Swarm:"],
+    "kids": ["[KIDS]", "[KK]", "Kids:", "Kid:", "KK:"],
+    "mb": ["MB:", "Miniboss:", "Mini boss:", "Mini-boss:"],
+}
+TAG_LABELS = {"swarms": "Swarms", "kids": "Kids", "mb": "Miniboss"}
+REGION_RE = re.compile(r"(?<![A-Za-z0-9])(Kanto|Johto|Hoenn|Sinnoh|Unova|[KJHSU])\s*:", re.I)
+FLAG_RE = re.compile(r"^\s*:(\w*):")
+# chatter that trails a callout; it ends the whole section
+SECTION_END_RE = re.compile(r"\bwhisp|\bwisp\b|\bplease\b|\bplz\b|\bpls\b|<3|\{", re.I)
+# per-value noise: "@11:26" times, "Wisp New/gone for update>" tails
+VALUE_END_RE = re.compile(r"@\s*\d|\bwhisp|\bwisp\b|\bplease\b|\bplz\b|\bpls\b|<|>|\{", re.I)
+SPLIT_RE = re.compile(r"[|/,]")
+KIDS_MAX = 3
+
+
+def tag_regex(tags):
+    """Case-insensitive matcher for a list of tags; 'MB:' also matches 'mb :'."""
+    alts = []
+    for t in sorted({t.strip() for t in tags if t.strip()}, key=len, reverse=True):
+        e = re.escape(t).replace(r"\ ", r"\s*").replace(":", r"\s*:")
+        if t[0].isalnum():  # bare words must not be the tail of another word
+            e = r"(?<![A-Za-z0-9])" + e
+        alts.append(e)
+    return re.compile("|".join(alts), re.I) if alts else None
+
+
+def build_tags(extra=None):
+    extra = extra or {}
+    return {k: tag_regex(v + list(extra.get(k, []))) for k, v in DEFAULT_TAGS.items()}
+
+
+def clean_value(raw):
+    """'Alpha _NidoK ' -> 'Alpha_NidoK', 'rt. 24' -> 'R24', 'R21 @11:16' -> 'R21'."""
+    m = VALUE_END_RE.search(raw)
+    if m:
+        raw = raw[: m.start()]
+    raw = raw.strip(" \t|/,;:-.")
+    raw = re.sub(r"\s*_\s*", "_", raw)
+    raw = re.sub(r"\b(?:rt|route)[.\-\s]*(\d+)", r"R\1", raw, flags=re.I)
+    return raw[:1].upper() + raw[1:]
+
+
+def clean_spot(raw):
+    """Kid/MB spot: like clean_value, plus a bare number means a route ('Rt-24/14' -> R24, R14)."""
+    raw = clean_value(raw)
+    return "R" + raw if raw.isdigit() else raw
+
+
+def parse_callout(msg, tags):
+    """Pull swarms / kids / miniboss out of one chat message, whatever layout the caller used.
+    Returns {"swarms": {code: (value, status)}, "kids": (flag, [(value, status)]), "mb": (value, status)}
+    with only the parts that were found, or {} when it isn't a callout."""
+    hits = []
+    for kind, rx in tags.items():
+        if rx:
+            hits += [(m.start(), m.end(), kind, m.group(0).startswith("[")) for m in rx.finditer(msg)]
+    hits.sort()
+    sections = {}
+    last_end = -1
+    for i, (start, end, kind, bracketed) in enumerate(hits):
+        if start < last_end:  # overlaps the previous tag
+            continue
+        last_end = end
+        nxt = next((h[0] for h in hits[i + 1:] if h[0] >= end), len(msg))
+        sections.setdefault(kind, (msg[end:nxt], bracketed))
+
+    out = {}
+    if "swarms" in sections:
+        text, bracketed = sections["swarms"]
+        marks = list(REGION_RE.finditer(text))
+        swarms = {}
+        for j, m in enumerate(marks):
+            code = m.group(1)[0].upper()
+            if code in swarms:  # e.g. the "K:" in "...| K:Kids: ..." belongs to the kids part
+                continue
+            raw = text[m.end(): marks[j + 1].start() if j + 1 < len(marks) else len(text)]
+            swarms[code] = parse_value(clean_value(raw))
+        if swarms and (bracketed or len(swarms) >= 2):
+            out["swarms"] = swarms
+
+    if "kids" in sections:
+        text, bracketed = sections["kids"]
+        flag = ""
+        m = FLAG_RE.match(text)
+        if m:
+            flag, text = m.group(1), text[m.end():]
+        m = SECTION_END_RE.search(text)
+        if m:
+            text = text[: m.start()]
+        slots = []
+        for part in SPLIT_RE.split(text):
+            value = clean_spot(part)
+            if value:
+                slots.append(parse_value(value))
+        slots = slots[:KIDS_MAX]
+        if bracketed or len(slots) >= 2:
+            out["kids"] = (flag, slots)
+
+    if "mb" in sections and ("swarms" in out or "kids" in out or sections["mb"][1]):
+        text = SPLIT_RE.split(sections["mb"][0], 1)[0]
+        out["mb"] = parse_value(clean_spot(text))
+    return out
+
+
+def describe_callout(found):
+    """Human-readable preview of parse_callout() output, for the Settings dialog."""
+    if not found:
+        return "Nothing recognized.\nAdd the word the caller puts before the list (e.g. \"Swarms:\") as a tag above."
+    def fmt(v, s):
+        return (v or "?") + {"unconfirmed": " (?)", "old": " (old)"}.get(s, "")
+    lines = []
+    if "swarms" in found:
+        lines.append("Swarms   " + "   ".join(f"{c}: {fmt(*found['swarms'].get(c, (None, 'unknown')))}"
+                                             for c, _, _ in REGIONS))
+    if "kids" in found:
+        flag, slots = found["kids"]
+        lines.append("Kids     " + (" | ".join(fmt(*s) for s in slots) or "?") + (f"   [{flag}]" if flag else ""))
+    if "mb" in found:
+        lines.append("MB       " + fmt(*found["mb"]))
+    return "\n".join(lines)
 
 # Your own Team messages never count as requests, and replying clears one. Your character names
 # come from Settings, and are also auto-detected from "<you> sent out X!" at the start of wild battles.
@@ -133,6 +257,7 @@ class Tracker:
         self.request = None  # (ts, who, msg) of an unanswered Team request
         self.kids_acked = None  # kids_complete_key() at the last copy
         self._wild_pending = False
+        self.tags = build_tags()
 
     def kids_complete_key(self):
         """Key of the current kid spots if all 3 are confirmed, else None."""
@@ -181,10 +306,14 @@ class Tracker:
             elif REQUEST_TOPIC_RE.search(msg) and REQUEST_ASK_RE.search(msg):
                 self.request = (ts, who, msg)
 
-        if "[SWARMS]" in msg:
-            self._swarms(msg, ts, who)
-        elif "[KIDS]" in msg:
-            self._kids(msg, ts, who)
+        found = parse_callout(msg, self.tags)
+        if "swarms" in found:
+            self._swarms(found["swarms"], ts, who)
+        if "kids" in found:
+            self._kids(*found["kids"], ts, who)
+        if "mb" in found:
+            self.mb.update(*found["mb"], ts)
+            self.kids_last = (ts, who)
 
     def summary(self):
         """Compact copyable snapshot of swarms, kids and miniboss, fitted to the chat limit.
@@ -199,38 +328,16 @@ class Tracker:
         mb = fmt(self.mb.value, self.mb.status)
         return f"SW {sw} | MB {mb} | KK {kk}"[:CHAT_LIMIT]
 
-    def _swarms(self, msg, ts, who):
-        body = msg.split("[SWARMS]", 1)[1]
-        seen = False
-        for part in body.split("||"):
-            m = re.match(r"\s*([KJHSU])\s*:\s*(.+)", part)
-            if not m:
-                continue
-            raw = re.split(r"\s+Wisp\b|>", m.group(2))[0]  # drop the trailing "Wisp New/gone..." text
-            value, status = parse_value(raw)
-            self.swarms[m.group(1)].update(value, status, ts)
-            seen = True
-        if seen:
-            self.swarm_last = (ts, who)
+    def _swarms(self, swarms, ts, who):
+        for code, (value, status) in swarms.items():
+            self.swarms[code].update(value, status, ts)
+        self.swarm_last = (ts, who)
 
-    def _kids(self, msg, ts, who):
-        m = KIDS_RE.search(msg)
-        if not m:
-            return
-        flag, rest = m.group(1), m.group(2)
+    def _kids(self, flag, found, ts, who):
         if flag.upper() == "RESET":
             self.kids_first = {}
-        # Callers sometimes forget the "|" before MB ("? MB: I2"), so split MB out first.
-        mb_at = rest.upper().find("MB:")
-        if mb_at >= 0:
-            mb_part = rest[mb_at + 3:].split("|", 1)[0]
-            self.mb.update(*parse_value(mb_part), ts)
-            rest = rest[:mb_at] + "|" + (rest[mb_at:].split("|", 1)[1] if "|" in rest[mb_at:] else "")
         slots, present = [], {}
-        for part in (p.strip() for p in rest.split("|")):
-            if not part or part.lower().startswith("please"):
-                continue
-            name, status = parse_value(part)
+        for name, status in found:
             first = None
             if name:
                 k = base_key(name)
@@ -346,6 +453,7 @@ class App:
         self.settings = load_settings()
         self.tracker = Tracker()
         self.tracker.me.update(self.settings.get("my_names", []))
+        self.tracker.tags = build_tags(self.settings.get("extra_tags"))
         self.game_dir = find_game_dir(self.settings.get("game_dir"))
         self.tailer = Tailer(os.path.join(self.game_dir, "log") if self.game_dir else "")
         mode = self.settings.get("mode")
@@ -374,6 +482,7 @@ class App:
         setup = tk.Menu(menubar, tearoff=0)
         setup.add_command(label="Set PokeMMO folder…", command=self._pick_game_dir)
         setup.add_command(label="Set my character names…", command=self._set_names)
+        setup.add_command(label="Callout formats…", command=self._callout_formats)
         menubar.add_cascade(label="Settings", menu=setup)
         root.config(menu=menubar)
         self._apply_opacity()
@@ -462,6 +571,74 @@ class App:
         names = {n.strip() for n in text.split(",") if n.strip()}
         self.tracker.me = names
         self._save_names()
+
+    def _callout_formats(self):
+        """Extra tags for callers who label their lists differently, with a live paste-and-test preview."""
+        win = tk.Toplevel(self.root, bg=BG, padx=12, pady=10)
+        win.title("Callout formats")
+        win.attributes("-topmost", True)
+        win.transient(self.root)
+        extra = self.settings.get("extra_tags", {})
+
+        tk.Label(win, text="Extra tags (comma separated). Built in: " +
+                 "  ".join(t for tags in DEFAULT_TAGS.values() for t in tags),
+                 bg=BG, fg=DIM, font=("Segoe UI", 8), wraplength=460, justify="left").pack(anchor="w")
+        entries = {}
+        for kind in DEFAULT_TAGS:
+            row = tk.Frame(win, bg=BG)
+            row.pack(fill="x", pady=2)
+            tk.Label(row, text=TAG_LABELS[kind], bg=BG, fg=FG, font=BOLD, width=9, anchor="w").pack(side="left")
+            e = tk.Entry(row, bg=CARD, fg=FG, insertbackground=FG, relief="flat", font=FONT)
+            e.insert(0, ", ".join(extra.get(kind, [])))
+            e.pack(side="left", fill="x", expand=True, ipady=2)
+            entries[kind] = e
+
+        tk.Label(win, text="Paste a callout from chat to test it:", bg=BG, fg=FG, font=BOLD).pack(anchor="w", pady=(10, 2))
+        box = tk.Text(win, height=3, width=64, bg=CARD, fg=FG, insertbackground=FG, relief="flat",
+                      font=FONT, wrap="word")
+        box.pack(fill="x")
+        preview = tk.Label(win, text="", bg=BG, fg=DIM, font=("Consolas", 9), justify="left", anchor="w")
+        preview.pack(fill="x", pady=(6, 8))
+
+        def current_extra():
+            return {k: [t.strip() for t in e.get().split(",") if t.strip()] for k, e in entries.items()}
+
+        def refresh(_e=None):
+            text = box.get("1.0", "end").strip()
+            if not text:
+                preview.configure(text="", fg=DIM)
+                return
+            m = LINE_RE.match(text)  # full log line or just the message both work
+            if m:
+                text = m.group(4)
+            text = META_RE.sub("", COLOR_RE.sub("", text))
+            found = parse_callout(text, build_tags(current_extra()))
+            preview.configure(text=describe_callout(found), fg="#3fbf6f" if found else "#e2b53a")
+
+        box.bind("<KeyRelease>", refresh)
+        box.bind("<<Paste>>", lambda e: win.after(10, refresh))
+        for e in entries.values():
+            e.bind("<KeyRelease>", refresh)
+
+        def save():
+            self.settings["extra_tags"] = {k: v for k, v in current_extra().items() if v}
+            save_settings(self.settings)
+            self._reload_tags()
+            win.destroy()
+
+        btns = tk.Frame(win, bg=BG)
+        btns.pack(fill="x")
+        tk.Button(btns, text="Save", command=save, bg="#2a2e37", fg=FG, relief="flat", padx=12).pack(side="right")
+        tk.Button(btns, text="Cancel", command=win.destroy, bg=BG, fg=DIM, relief="flat", padx=8).pack(side="right", padx=6)
+
+    def _reload_tags(self):
+        """Apply new tags and re-read today's log so callouts that were missed show up right away."""
+        old = self.tracker
+        self.tracker = Tracker()
+        self.tracker.me = old.me
+        self.tracker.tags = build_tags(self.settings.get("extra_tags"))
+        self.tracker.kids_acked = old.kids_acked
+        self.tailer.path, self.tailer.pos, self.tailer.buf = None, 0, b""
 
     def _save_names(self):
         self.settings["my_names"] = sorted(self.tracker.me)

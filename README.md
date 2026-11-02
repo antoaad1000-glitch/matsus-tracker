@@ -19,6 +19,17 @@ A small always-on-top window for PokeMMO that keeps the latest event callouts fr
 - **Copy**: copies a one-line summary that fits in chat, e.g.
   `SW K:Ekans_QB_1 J:Hoot_QB_2 H:? S:Alpha_Electabuzz U:? | MB Saffron | KK Saffron R24 I1_NORTH`
 
+### Any caller's format
+
+Callers all write callouts a bit differently, so the tracker looks for the section labels (`[SWARMS]`, `Swarms:`, `[KIDS]`, `KK:`, `MB:`…) anywhere in a message and reads what sits between them, whatever separators are used (`|`, `||`, `/`, `,`). Both of these work:
+
+```
+[SWARMS] K:? || J:Alpha_NidoK || H:? || S:Dusk_QB_1 || U:Pooch_QB_2 < KK:Lavender/Rt-24/14 || MB: i2 >Please whisper
+Swarms: K:  |J: Alpha _NidoK |H:  |S: dusk_1| U:pooch_2 |K:Kids: lavender/ rt. 24 / rt.14 / MB: i2_CB | Whisp. Me plz <3
+```
+
+If a caller uses a label the tracker doesn't know, add it in **Settings › Callout formats…**. That window also lets you paste any chat line and see exactly what the tracker reads from it.
+
 ### Other
 
 - Always-on-top toggle and adjustable transparency (View menu)

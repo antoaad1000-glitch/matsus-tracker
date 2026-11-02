@@ -27,6 +27,9 @@ USING IT
 - Event menu: pick the event (Halloween is the one set up so far).
 - View menu: see-through level.
 - on top: keep the window above the game, or not.
+- Settings -> Callout formats...: if a caller's callouts don't show up,
+  paste one of their lines there to see what the tracker reads, and add
+  the label they use (e.g. "Swarm list:") as an extra tag.
 
 It only READS the chat log file on your PC. It doesn't touch the game,
 send anything, or need your login. Settings are saved in
