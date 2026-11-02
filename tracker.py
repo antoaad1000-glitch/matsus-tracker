@@ -71,9 +71,13 @@ STATUS_RE = re.compile(r"\((\?|old)\)\s*$", re.I)
 # Users can add their own tags in Settings › Callout formats.
 DEFAULT_TAGS = {
     "swarms": ["[SWARMS]", "[SWARM]", "Swarms:", "Swarm:"],
-    "kids": ["[KIDS]", "[KK]", "Kids:", "Kid:", "KK:"],
-    "mb": ["MB:", "Miniboss:", "Mini boss:", "Mini-boss:"],
+    "kids": ["[KIDS]", "[KK]", "Kids:", "Kid:", "KK:", "Kids", "KK"],
+    "mb": ["MB:", "Miniboss:", "Mini boss:", "Mini-boss:", "MB", "Miniboss"],
 }
+# How much a tag is trusted: "[KIDS]" always counts; "KK:" needs a list; a bare "kk" (casual
+# "kk r2 / 7 / 11") needs a list where every entry looks like a place, so chat like "kk where?" is ignored.
+BRACKET, COLON, LOOSE = 2, 1, 0
+SPOT_RE = re.compile(r"^[A-Za-z0-9][\w.'\-]*(?: [\w.'\-]+)?$")
 TAG_LABELS = {"swarms": "Swarms", "kids": "Kids", "mb": "Miniboss"}
 REGION_RE = re.compile(r"(?<![A-Za-z0-9])(Kanto|Johto|Hoenn|Sinnoh|Unova|[KJHSU])\s*:", re.I)
 FLAG_RE = re.compile(r"^\s*:(\w*):")
@@ -92,8 +96,15 @@ def tag_regex(tags):
         e = re.escape(t).replace(r"\ ", r"\s*").replace(":", r"\s*:")
         if t[0].isalnum():  # bare words must not be the tail of another word
             e = r"(?<![A-Za-z0-9])" + e
+        if t[-1].isalnum():  # "KK" must not match the start of "kkk" or "kkdo"
+            e += r"(?![A-Za-z0-9])"
         alts.append(e)
     return re.compile("|".join(alts), re.I) if alts else None
+
+
+def tag_strength(tag):
+    tag = tag.strip()
+    return BRACKET if tag.startswith("[") else COLON if tag.endswith(":") else LOOSE
 
 
 def build_tags(extra=None):
@@ -125,20 +136,21 @@ def parse_callout(msg, tags):
     hits = []
     for kind, rx in tags.items():
         if rx:
-            hits += [(m.start(), m.end(), kind, m.group(0).startswith("[")) for m in rx.finditer(msg)]
+            hits += [(m.start(), m.end(), kind, tag_strength(m.group(0))) for m in rx.finditer(msg)]
     hits.sort()
     sections = {}
     last_end = -1
-    for i, (start, end, kind, bracketed) in enumerate(hits):
+    for i, (start, end, kind, strength) in enumerate(hits):
         if start < last_end:  # overlaps the previous tag
             continue
         last_end = end
         nxt = next((h[0] for h in hits[i + 1:] if h[0] >= end), len(msg))
-        sections.setdefault(kind, (msg[end:nxt], bracketed))
+        if kind not in sections or strength > sections[kind][1]:  # the most explicit tag wins
+            sections[kind] = (msg[end:nxt], strength)
 
     out = {}
     if "swarms" in sections:
-        text, bracketed = sections["swarms"]
+        text, strength = sections["swarms"]
         marks = list(REGION_RE.finditer(text))
         swarms = {}
         for j, m in enumerate(marks):
@@ -147,11 +159,11 @@ def parse_callout(msg, tags):
                 continue
             raw = text[m.end(): marks[j + 1].start() if j + 1 < len(marks) else len(text)]
             swarms[code] = parse_value(clean_value(raw))
-        if swarms and (bracketed or len(swarms) >= 2):
+        if swarms and (strength == BRACKET or len(swarms) >= 2):
             out["swarms"] = swarms
 
     if "kids" in sections:
-        text, bracketed = sections["kids"]
+        text, strength = sections["kids"]
         flag = ""
         m = FLAG_RE.match(text)
         if m:
@@ -165,10 +177,11 @@ def parse_callout(msg, tags):
             if value:
                 slots.append(parse_value(value))
         slots = slots[:KIDS_MAX]
-        if bracketed or len(slots) >= 2:
+        looks_like_spots = all(v is None or (len(v) <= 24 and SPOT_RE.match(v)) for v, _ in slots)
+        if strength == BRACKET or (len(slots) >= 2 and (strength == COLON or looks_like_spots)):
             out["kids"] = (flag, slots)
 
-    if "mb" in sections and ("swarms" in out or "kids" in out or sections["mb"][1]):
+    if "mb" in sections and ("swarms" in out or "kids" in out or sections["mb"][1] == BRACKET):
         text = SPLIT_RE.split(sections["mb"][0], 1)[0]
         out["mb"] = parse_value(clean_spot(text))
     return out
